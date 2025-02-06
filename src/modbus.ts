@@ -1,9 +1,11 @@
 import ModbusRTU from "modbus-serial";
-import type { NetworkDevice, InverterStatus } from "./types";
-
-const convertToSigned16 = (value: number): number => {
-  return value > 32767 ? value - 65536 : value;
-};
+import type { NetworkDevice } from "./types";
+import {
+  decodeString,
+  parse16BitValue,
+  parse32BitValue,
+  parseSignedValue,
+} from "./parsers";
 
 export class GoodweClient {
   private client: ModbusRTU;
@@ -17,33 +19,95 @@ export class GoodweClient {
     await this.client.setID(1);
   }
 
-  async getStatus(): Promise<InverterStatus> {
-    const test = await this.client.readHoldingRegisters(35209, 4);
+  async readRegisters(address: number, length: number): Promise<number[]> {
+    try {
+      const result = await this.client.readHoldingRegisters(address, length);
+      return result.data;
+    } catch (error) {
+      console.error("Failed to read registers", error);
+      throw error;
+    }
+  }
 
-    console.log("----", test.data);
-
-    const batteryData = await this.client.readHoldingRegisters(35180, 4);
-    const batteryPower = convertToSigned16(batteryData.data[0]); // Battery power in W (positive=charge, negative=discharge)
-    const batterySoC = batteryData.data[2]; // Battery State of Charge in %
-
-    const powerData = await this.client.readHoldingRegisters(35121, 5);
-    const pvPower = powerData.data[0]; // Total PV Power in W
-    const gridPower = convertToSigned16(powerData.data[2]); // Grid power in W (positive=import, negative=export)
-    const loadPower = powerData.data[4]; // House load power in W
+  async readDeviceInfo(): Promise<{
+    protocolVersion: number;
+    ratedPower: number;
+    serialNumber: string;
+    deviceType: string;
+  }> {
+    const registers = await this.readRegisters(35000, 16);
 
     return {
-      batteryPower,
-      batterySoC,
-      pvPower,
-      gridPower,
-      loadPower,
+      protocolVersion: registers[0],
+      ratedPower: registers[1],
+      serialNumber: decodeString(registers.slice(3, 11)),
+      deviceType: decodeString(registers.slice(11, 16)).trim(),
     };
   }
 
-  async setBatteryPower(power: number): Promise<void> {
-    // Convert power to appropriate register value
-    const registerValue = Math.floor(power * 10);
-    await this.client.writeRegister(0x891c, registerValue);
+  async readSystemData(): Promise<{
+    solarPower: number;
+    gridImportPower: number;
+    gridExportPower: number;
+    chargePower: number;
+    dischargePower: number;
+    batteryVoltage: number;
+    maxChargePower: number;
+    maxDischargePower: number;
+    ratedPower: number;
+    stateOfCharge: number;
+    stateOfHealth: number;
+    systemTime: Date;
+    deviceType: string;
+    serialNumber: string;
+    batteryMode: number;
+  }> {
+    const deviceInfo = await this.readRegisters(35000, 20);
+    const runningData = await this.readRegisters(35100, 110);
+    const batteryData = await this.readRegisters(37000, 23);
+
+    const pvPower1 = parse32BitValue(runningData, 5);
+    const pvPower2 = parse32BitValue(runningData, 9);
+    const pvPower3 = parse32BitValue(runningData, 13);
+    const pvPower4 = parse32BitValue(runningData, 17);
+
+    const totalPvPower = pvPower1 + pvPower2 + pvPower3 + pvPower4;
+    const gridPower = parseSignedValue(runningData, 40);
+    const ratedPower = parse16BitValue(deviceInfo, 1);
+    const batteryVoltage = parse16BitValue(runningData, 80, 10);
+    const batteryPower = parseSignedValue(runningData, 83);
+    const batteryMode = parse16BitValue(runningData, 84);
+    const maxChargeCurrent = parse16BitValue(batteryData, 4);
+    const maxDischargeCurrent = parse16BitValue(batteryData, 5);
+
+    return {
+      solarPower: totalPvPower,
+      gridImportPower: gridPower < 0 ? -gridPower : 0,
+      gridExportPower: gridPower > 0 ? gridPower : 0,
+      chargePower: batteryPower < 0 ? -batteryPower : 0,
+      dischargePower: batteryPower > 0 ? batteryPower : 0,
+      maxChargePower: maxChargeCurrent * batteryVoltage,
+      maxDischargePower: maxDischargeCurrent * batteryVoltage,
+      batteryVoltage,
+      ratedPower: ratedPower,
+      stateOfCharge: parse16BitValue(batteryData, 7),
+      stateOfHealth: parse16BitValue(batteryData, 8),
+      systemTime: new Date(
+        2000 + (runningData[0] >> 8),
+        (runningData[0] & 0xff) - 1,
+        runningData[1] >> 8,
+        runningData[1] & 0xff,
+        runningData[2] >> 8,
+        runningData[2] & 0xff
+      ),
+      deviceType: decodeString(deviceInfo.slice(11, 16)).trim(),
+      serialNumber: decodeString(deviceInfo.slice(3, 11)),
+      batteryMode,
+    };
+  }
+
+  async changeBatteryMode(mode: number): Promise<void> {
+    await this.client.writeRegister(145, mode);
   }
 
   async close(): Promise<void> {

@@ -4,6 +4,7 @@ export interface InverterStatus {
   pvPower: number;
   gridPower: number;
   loadPower: number;
+  batteryTemp: number;
 }
 
 export interface NetworkDevice {
